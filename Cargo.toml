@@ -1,0 +1,15 @@
+[package]
+name = "jqr"
+version = "0.1.0"
+edition = "2024"
+description = "jq for broken JSON - repairs truncated/mangled JSON before querying"
+license = "MIT"
+
+[dependencies]
+serde_json = "1"
+serde = "1"
+jsonrepair-rs = "0.2"
+
+[profile.release]
+lto = true
+strip = true
