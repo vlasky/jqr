@@ -1,6 +1,7 @@
 use std::env;
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio, exit};
+use std::thread;
 
 mod args;
 mod repair;
@@ -14,20 +15,14 @@ fn main() {
         return;
     }
 
-    // -h/--help: show jqr help
-    if argv.iter().any(|a| a == "-h" || a == "--help") {
+    // Extract jqr-specific flags, respecting argument positions.
+    // Flags that are values to --arg/--argjson/etc must not be stripped.
+    let (no_jq, quiet, strict, show_help, argv) = extract_jqr_flags(&argv);
+
+    if show_help {
         print_help();
         return;
     }
-
-    // Extract jqr-specific flags
-    let no_jq = argv.iter().any(|a| a == "--no-jq");
-    let quiet = argv.iter().any(|a| a == "--quiet");
-    let strict = argv.iter().any(|a| a == "--strict");
-    let argv: Vec<String> = argv
-        .into_iter()
-        .filter(|a| a != "--no-jq" && a != "--quiet" && a != "--strict")
-        .collect();
 
     // Meta flags: pass straight to jq
     if argv.iter().any(|a| args::is_meta_flag(a)) {
@@ -99,7 +94,7 @@ fn main() {
         return;
     }
 
-    // Feed repaired NDJSON to jq
+    // Feed repaired NDJSON to jq via a writer thread to avoid pipe deadlock
     let ndjson = objects.join("\n");
 
     let mut child = Command::new("jq")
@@ -110,14 +105,17 @@ fn main() {
         .spawn()
         .unwrap_or_else(|_| { eprintln!("jqr: jq not found"); exit(1); });
 
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(ndjson.as_bytes());
-    }
+    let mut child_stdin = child.stdin.take().unwrap();
+    let writer = thread::spawn(move || {
+        let _ = child_stdin.write_all(ndjson.as_bytes());
+    });
 
     let output = child.wait_with_output().unwrap_or_else(|e| {
         eprintln!("jqr: failed to run jq: {e}");
         exit(1);
     });
+
+    let _ = writer.join();
 
     if !output.status.success() {
         let _ = io::stderr().write_all(&output.stderr);
@@ -125,6 +123,83 @@ fn main() {
     }
 
     let _ = io::stdout().write_all(&output.stdout);
+}
+
+/// Extract jqr-specific flags from argv, skipping tokens that are consumed as
+/// values by preceding options (--arg, --argjson, etc).
+fn extract_jqr_flags(argv: &[String]) -> (bool, bool, bool, bool, Vec<String>) {
+    let mut no_jq = false;
+    let mut quiet = false;
+    let mut strict = false;
+    let mut show_help = false;
+    let mut result: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < argv.len() {
+        let tok = &argv[i];
+
+        // After --args/--jsonargs, everything is a positional value
+        if tok == "--args" || tok == "--jsonargs" {
+            result.extend(argv[i..].iter().cloned());
+            break;
+        }
+
+        // Check if this is a long option that consumes extra tokens
+        if tok.starts_with("--") && !tok.contains('=') {
+            let extra = args::long_option_extra(tok);
+            if extra > 0 {
+                // Push this flag and its values through unchanged
+                result.push(tok.clone());
+                for j in 1..=extra {
+                    if i + j < argv.len() {
+                        result.push(argv[i + j].clone());
+                    }
+                }
+                i += 1 + extra;
+                continue;
+            }
+        }
+
+        // Check if this is a short flag bundle containing an extra-consuming flag
+        if tok.starts_with('-') && !tok.starts_with("--") && tok != "-" {
+            let chars: Vec<char> = tok[1..].chars().collect();
+            let has_extra = chars.iter().any(|c| args::short_flag_extra(*c) > 0);
+            if has_extra {
+                // This bundle consumes a following token; pass through unchanged
+                result.push(tok.clone());
+                // Find the extra-consuming char and count tokens it needs
+                for (ci, &ch) in chars.iter().enumerate() {
+                    let extra = args::short_flag_extra(ch);
+                    if extra > 0 {
+                        let mut remaining = extra;
+                        if ci + 1 < chars.len() {
+                            remaining -= 1; // rest of bundle is first arg
+                        }
+                        for _ in 0..remaining {
+                            i += 1;
+                            if i < argv.len() {
+                                result.push(argv[i].clone());
+                            }
+                        }
+                        break;
+                    }
+                }
+                i += 1;
+                continue;
+            }
+        }
+
+        match tok.as_str() {
+            "--no-jq" => no_jq = true,
+            "--quiet" => quiet = true,
+            "--strict" => strict = true,
+            "-h" | "--help" => show_help = true,
+            _ => result.push(tok.clone()),
+        }
+        i += 1;
+    }
+
+    (no_jq, quiet, strict, show_help, result)
 }
 
 fn print_help() {

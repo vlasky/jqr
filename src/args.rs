@@ -25,14 +25,21 @@ pub struct ParsedArgs {
     pub is_raw_input: bool,
 }
 
-fn short_extra(ch: char) -> usize {
+pub fn short_flag_extra(ch: char) -> usize {
     SHORT_EXTRA.iter().find(|(c, _)| *c == ch).map_or(0, |(_, n)| *n)
 }
 
-fn long_extra(s: &str) -> usize {
-    // Strip =value suffix for lookup
+pub fn long_option_extra(s: &str) -> usize {
     let key = s.split('=').next().unwrap_or(s);
     LONG_EXTRA.iter().find(|(k, _)| *k == key).map_or(0, |(_, n)| *n)
+}
+
+fn short_extra(ch: char) -> usize {
+    short_flag_extra(ch)
+}
+
+fn long_extra(s: &str) -> usize {
+    long_option_extra(s)
 }
 
 pub fn parse_jq_argv(argv: &[String], need_filter: bool) -> ParsedArgs {
