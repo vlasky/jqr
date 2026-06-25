@@ -5,7 +5,9 @@ use jsonrepair_rs::jsonrepair;
 fn parse_json(s: &str) -> Result<serde_json::Value, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_str(s);
     de.disable_recursion_limit();
-    serde_json::Value::deserialize(&mut de)
+    let val = serde_json::Value::deserialize(&mut de)?;
+    de.end()?;
+    Ok(val)
 }
 
 /// Detect if input is newline-delimited JSON (every non-empty line is valid JSON).
