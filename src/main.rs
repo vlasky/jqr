@@ -78,17 +78,23 @@ fn main() {
         let compact = parsed.jq_argv.iter().any(|a| a == "-c" || a == "--compact-output");
         let use_tab = parsed.jq_argv.iter().any(|a| a == "--tab");
         let indent = get_indent(&parsed.jq_argv);
+        // Each element is a validated JSON value stream (possibly multiple
+        // whitespace-separated values); print every value in it.
         for json_str in &objects {
-            let val: serde_json::Value = serde_json::from_str(json_str).unwrap_or_default();
-            if compact {
-                let _ = writeln!(out, "{}", serde_json::to_string(&val).unwrap_or_default());
-            } else if use_tab {
-                let formatted = format_with_indent(&val, "\t");
-                let _ = writeln!(out, "{formatted}");
-            } else {
-                let spaces = " ".repeat(indent);
-                let formatted = format_with_indent(&val, &spaces);
-                let _ = writeln!(out, "{formatted}");
+            let mut de = serde_json::Deserializer::from_str(json_str);
+            de.disable_recursion_limit();
+            for item in de.into_iter::<serde_json::Value>() {
+                let Ok(val) = item else { break };
+                if compact {
+                    let _ = writeln!(out, "{}", serde_json::to_string(&val).unwrap_or_default());
+                } else if use_tab {
+                    let formatted = format_with_indent(&val, "\t");
+                    let _ = writeln!(out, "{formatted}");
+                } else {
+                    let spaces = " ".repeat(indent);
+                    let formatted = format_with_indent(&val, &spaces);
+                    let _ = writeln!(out, "{formatted}");
+                }
             }
         }
         return;
