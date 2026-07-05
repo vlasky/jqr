@@ -1,9 +1,14 @@
 [package]
 name = "jqr"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "jq for broken JSON - repairs truncated/mangled JSON before querying"
 license = "MIT"
+authors = ["Vlad Lasky"]
+repository = "https://github.com/vlasky/jqr"
+readme = "README.md"
+keywords = ["jq", "json", "repair", "cli", "truncated"]
+categories = ["command-line-utilities"]
 
 [dependencies]
 serde_json = { version = "1", features = ["unbounded_depth"] }
