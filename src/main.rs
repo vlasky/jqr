@@ -7,6 +7,19 @@ mod args;
 mod repair;
 
 fn main() {
+    // jqr accepts arbitrarily deep JSON and jsonrepair recurses on nesting
+    // depth, so run everything on a thread with a large stack. jqr's own
+    // parsing and printing grow the stack on demand via serde_stacker.
+    let worker = thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(run)
+        .expect("jqr: failed to spawn worker thread");
+    if worker.join().is_err() {
+        exit(101);
+    }
+}
+
+fn run() {
     let argv: Vec<String> = env::args().skip(1).collect();
 
     // No args on a TTY: show help
@@ -77,58 +90,48 @@ fn main() {
         let mut out = stdout.lock();
         let compact = parsed.jq_argv.iter().any(|a| a == "-c" || a == "--compact-output");
         let use_tab = parsed.jq_argv.iter().any(|a| a == "--tab");
-        let indent = get_indent(&parsed.jq_argv);
+        let spaces = " ".repeat(get_indent(&parsed.jq_argv));
         // Each element is a validated JSON value stream (possibly multiple
         // whitespace-separated values); print every value in it.
         for json_str in &objects {
             let mut de = serde_json::Deserializer::from_str(json_str);
             de.disable_recursion_limit();
-            for item in de.into_iter::<serde_json::Value>() {
-                let Ok(val) = item else { break };
-                if compact {
-                    let _ = writeln!(out, "{}", serde_json::to_string(&val).unwrap_or_default());
+            for item in de.into_iter::<repair::DeepValue>() {
+                let Ok(repair::DeepValue(val)) = item else { break };
+                let formatted = if compact {
+                    serialize_deep(&val, serde_json::ser::CompactFormatter)
                 } else if use_tab {
-                    let formatted = format_with_indent(&val, "\t");
-                    let _ = writeln!(out, "{formatted}");
+                    serialize_deep(&val, serde_json::ser::PrettyFormatter::with_indent(b"\t"))
                 } else {
-                    let spaces = " ".repeat(indent);
-                    let formatted = format_with_indent(&val, &spaces);
-                    let _ = writeln!(out, "{formatted}");
-                }
+                    serialize_deep(&val, serde_json::ser::PrettyFormatter::with_indent(spaces.as_bytes()))
+                };
+                let _ = writeln!(out, "{formatted}");
+                repair::drop_deep(val);
             }
         }
         return;
     }
 
-    // Feed repaired NDJSON to jq via a writer thread to avoid pipe deadlock
+    // Feed the repaired stream to jq. Its stdout/stderr are inherited, so
+    // output streams through unbuffered, per-input errors reach stderr even
+    // when jq exits 0, and no deadlock is possible: we hold only jq's stdin.
     let ndjson = objects.join("\n");
 
     let mut child = Command::new("jq")
         .args(&parsed.jq_argv)
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
         .spawn()
         .unwrap_or_else(|_| { eprintln!("jqr: jq not found"); exit(1); });
 
-    let mut child_stdin = child.stdin.take().unwrap();
-    let writer = thread::spawn(move || {
-        let _ = child_stdin.write_all(ndjson.as_bytes());
-    });
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(ndjson.as_bytes());
+    }
 
-    let output = child.wait_with_output().unwrap_or_else(|e| {
+    let status = child.wait().unwrap_or_else(|e| {
         eprintln!("jqr: failed to run jq: {e}");
         exit(1);
     });
-
-    let _ = writer.join();
-
-    if !output.status.success() {
-        let _ = io::stderr().write_all(&output.stderr);
-        exit(output.status.code().unwrap_or(1));
-    }
-
-    let _ = io::stdout().write_all(&output.stdout);
+    exit(status.code().unwrap_or(1));
 }
 
 /// Extract jqr-specific flags from argv, skipping tokens that are consumed as
@@ -146,6 +149,13 @@ fn extract_jqr_flags(argv: &[String]) -> (bool, bool, bool, bool, Vec<String>) {
 
         // After --args/--jsonargs, everything is a positional value
         if tok == "--args" || tok == "--jsonargs" {
+            result.extend(argv[i..].iter().cloned());
+            break;
+        }
+
+        // After the option terminator, everything is filter/file arguments
+        // for jq, never jqr flags
+        if tok == "--" {
             result.extend(argv[i..].iter().cloned());
             break;
         }
@@ -278,11 +288,36 @@ fn get_indent(jq_argv: &[String]) -> usize {
     indent
 }
 
-fn format_with_indent(val: &serde_json::Value, indent: &str) -> String {
-    let mut buf = Vec::new();
-    let formatter = serde_json::ser::PrettyFormatter::with_indent(indent.as_bytes());
-    let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+/// Serialize through serde_stacker so deeply nested values grow the stack
+/// on demand instead of overflowing it.
+fn serialize_deep<F: serde_json::ser::Formatter>(val: &serde_json::Value, formatter: F) -> String {
     use serde::Serialize;
-    val.serialize(&mut ser).unwrap();
+    let mut buf = Vec::new();
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+    let _ = val.serialize(serde_stacker::Serializer::new(&mut ser));
     String::from_utf8(buf).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sv(v: &[&str]) -> Vec<String> {
+        v.iter().map(|x| x.to_string()).collect()
+    }
+
+    #[test]
+    fn dashdash_stops_jqr_flag_stripping() {
+        let (no_jq, quiet, strict, help, rest) =
+            extract_jqr_flags(&sv(&["-n", "--", "--quiet", "--no-jq", "--help"]));
+        assert!(!no_jq && !quiet && !strict && !help);
+        assert_eq!(rest, sv(&["-n", "--", "--quiet", "--no-jq", "--help"]));
+    }
+
+    #[test]
+    fn jqr_flags_before_dashdash_still_stripped() {
+        let (_, quiet, _, _, rest) = extract_jqr_flags(&sv(&["--quiet", "--", "--no-jq"]));
+        assert!(quiet);
+        assert_eq!(rest, sv(&["--", "--no-jq"]));
+    }
 }

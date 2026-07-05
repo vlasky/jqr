@@ -2,10 +2,44 @@ use std::io::IsTerminal;
 use serde::Deserialize;
 use jsonrepair_rs::jsonrepair;
 
+/// serde_json::Value that deserializes through serde_stacker, growing the
+/// stack on demand so arbitrarily deep JSON parses instead of overflowing.
+pub struct DeepValue(pub serde_json::Value);
+
+impl<'de> Deserialize<'de> for DeepValue {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        serde_json::Value::deserialize(serde_stacker::Deserializer::new(d)).map(DeepValue)
+    }
+}
+
+/// Parse-and-discard marker with the same stack-growing behaviour, for
+/// validation passes that don't need to build the value.
+struct DeepIgnored;
+
+impl<'de> Deserialize<'de> for DeepIgnored {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        serde::de::IgnoredAny::deserialize(serde_stacker::Deserializer::new(d))?;
+        Ok(DeepIgnored)
+    }
+}
+
+/// Drop a Value iteratively; the compiler-generated recursive drop overflows
+/// the stack on deeply nested values.
+pub fn drop_deep(val: serde_json::Value) {
+    let mut stack = vec![val];
+    while let Some(v) = stack.pop() {
+        match v {
+            serde_json::Value::Array(arr) => stack.extend(arr),
+            serde_json::Value::Object(map) => stack.extend(map.into_iter().map(|(_, v)| v)),
+            _ => {}
+        }
+    }
+}
+
 fn parse_json(s: &str) -> Result<serde_json::Value, serde_json::Error> {
     let mut de = serde_json::Deserializer::from_str(s);
     de.disable_recursion_limit();
-    let val = serde_json::Value::deserialize(&mut de)?;
+    let val = DeepValue::deserialize(&mut de)?.0;
     de.end()?;
     Ok(val)
 }
@@ -17,7 +51,7 @@ fn validate_stream(s: &str) -> Result<(), String> {
     let mut de = serde_json::Deserializer::from_str(s);
     de.disable_recursion_limit();
     let mut count = 0usize;
-    for item in de.into_iter::<serde_json::Value>() {
+    for item in de.into_iter::<DeepIgnored>() {
         item.map_err(|e| e.to_string())?;
         count += 1;
     }
@@ -25,6 +59,29 @@ fn validate_stream(s: &str) -> Result<(), String> {
         return Err("empty input".to_string());
     }
     Ok(())
+}
+
+/// Split input into its leading valid JSON values (verbatim text) plus the
+/// unparseable remainder ("" when everything parsed). The bool reports
+/// whether parsing stopped on a truncation (unexpected EOF) rather than
+/// malformed content.
+fn scan_values(s: &str) -> (Vec<String>, &str, bool) {
+    let mut de = serde_json::Deserializer::from_str(s);
+    de.disable_recursion_limit();
+    let mut stream = de.into_iter::<DeepIgnored>();
+    let mut values = Vec::new();
+    let mut prev = 0usize;
+    loop {
+        match stream.next() {
+            Some(Ok(_)) => {
+                let end = stream.byte_offset();
+                values.push(s[prev..end].trim().to_string());
+                prev = end;
+            }
+            Some(Err(e)) => return (values, s[prev..].trim(), e.is_eof()),
+            None => return (values, "", false),
+        }
+    }
 }
 
 fn warn(msg: &str, quiet: bool) {
@@ -40,8 +97,10 @@ fn warn(msg: &str, quiet: bool) {
 
 /// Repair a source string. Returns a Vec of valid JSON stream strings.
 /// Valid input (single doc, NDJSON, or multi-document stream) passes through
-/// unchanged. NDJSON with a broken final record is repaired per-line so the
-/// intact records survive; everything else goes through whole-input repair.
+/// unchanged. A stream cut off inside its final value keeps the intact
+/// leading values and repairs only the tail. Line-oriented streams with
+/// broken records mid-stream are repaired per-line so the intact records
+/// survive; everything else goes through whole-input repair.
 pub fn repair_source(raw: &str, strict: bool, quiet: bool) -> Result<Vec<String>, String> {
     if strict {
         validate_stream(raw).map_err(|e| format!("invalid JSON: {e}"))?;
@@ -53,23 +112,35 @@ pub fn repair_source(raw: &str, strict: bool, quiet: bool) -> Result<Vec<String>
         return Ok(vec![raw.to_string()]);
     }
 
-    // NDJSON cut off mid-record: every line but the last parses. Repair only
-    // the final line so the intact records pass through untouched.
-    let lines: Vec<&str> = raw.lines().filter(|l| !l.trim().is_empty()).collect();
+    // Stream cut off inside its final value (NDJSON or whitespace-separated
+    // documents, on any number of lines): keep the intact leading values
+    // verbatim and repair only the truncated tail.
+    let (values, rest, truncated) = scan_values(raw);
+    if truncated && !values.is_empty() && !rest.is_empty() {
+        let repaired = jsonrepair(rest)
+            .map_err(|e| format!("repair failed on truncated final record: {e}"))?;
+        validate_stream(&repaired)
+            .map_err(|e| format!("repair produced invalid JSON: {e}"))?;
+        warn(
+            "repaired truncated final record (it may be incomplete)",
+            quiet,
+        );
+        let mut out = values;
+        out.push(repaired);
+        return Ok(out);
+    }
+
+    // Line-oriented input (NDJSON-ish) broken somewhere mid-stream: when at
+    // least half the lines are complete JSON records, repair each broken line
+    // on its own so the intact records survive. The threshold keeps broken
+    // pretty-printed documents (whose lines are fragments) out of this path.
+    let lines: Vec<&str> = raw.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
     if lines.len() >= 2 {
-        let (last, head) = lines.split_last().unwrap();
-        if head.iter().all(|l| parse_json(l).is_ok()) {
-            let repaired = jsonrepair(last)
-                .map_err(|e| format!("repair failed on final NDJSON record: {e}"))?;
-            parse_json(&repaired)
-                .map_err(|e| format!("repair produced invalid JSON: {e}"))?;
-            warn(
-                "repaired truncated final NDJSON record (it may be incomplete)",
-                quiet,
-            );
-            let mut out: Vec<String> = head.iter().map(|s| s.to_string()).collect();
-            out.push(repaired);
-            return Ok(out);
+        let parseable = lines.iter().filter(|l| validate_stream(l).is_ok()).count();
+        if parseable * 2 >= lines.len() {
+            if let Some(out) = repair_lines(&lines, quiet) {
+                return Ok(out);
+            }
         }
     }
 
@@ -89,7 +160,41 @@ pub fn repair_source(raw: &str, strict: bool, quiet: bool) -> Result<Vec<String>
             quiet,
         );
     }
+    drop_deep(val);
     Ok(vec![repaired])
+}
+
+/// Repair a line-oriented stream line by line, keeping each line's leading
+/// valid values and repairing only the broken rest. Returns None if any
+/// broken segment cannot be repaired (callers fall back to whole-input
+/// repair).
+fn repair_lines(lines: &[&str], quiet: bool) -> Option<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    let mut repaired_count = 0usize;
+    for line in lines {
+        if validate_stream(line).is_ok() {
+            out.push((*line).to_string());
+            continue;
+        }
+        let (values, rest, _) = scan_values(line);
+        out.extend(values);
+        if rest.is_empty() {
+            continue;
+        }
+        let repaired = jsonrepair(rest).ok()?;
+        validate_stream(&repaired).ok()?;
+        out.push(repaired);
+        repaired_count += 1;
+    }
+    if repaired_count > 0 {
+        warn(
+            &format!(
+                "repaired {repaired_count} broken record(s) mid-stream (non-JSON coerced, data may be missing)"
+            ),
+            quiet,
+        );
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -131,6 +236,58 @@ mod tests {
         assert_eq!(out[1], "{\"id\":2,\"v\":\"b\"}");
         let v: serde_json::Value = serde_json::from_str(&out[2]).unwrap();
         assert_eq!(v["id"], 3);
+    }
+
+    #[test]
+    fn truncated_multidoc_on_one_line_keeps_intact_values() {
+        let out = repair_source(r#"{"a":1} {"a":2"#, false, true).unwrap();
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], r#"{"a":1}"#);
+        let v: serde_json::Value = serde_json::from_str(&out[1]).unwrap();
+        assert_eq!(v["a"], 2);
+    }
+
+    #[test]
+    fn broken_middle_record_keeps_intact_records() {
+        let raw = "{\"a\":1}\n{\"a\":2} garbage\n{\"a\":3}";
+        let out = repair_source(raw, false, true).unwrap();
+        assert_eq!(out.len(), 4);
+        assert_eq!(out[0], "{\"a\":1}");
+        assert_eq!(out[1], "{\"a\":2}");
+        let coerced: serde_json::Value = serde_json::from_str(&out[2]).unwrap();
+        assert!(coerced.is_string());
+        assert_eq!(out[3], "{\"a\":3}");
+    }
+
+    #[test]
+    fn broken_first_record_keeps_later_records() {
+        let raw = "not json\n{\"a\":2}\n{\"a\":3}";
+        let out = repair_source(raw, false, true).unwrap();
+        assert_eq!(out.len(), 3);
+        let coerced: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert!(coerced.is_string());
+        assert_eq!(out[1], "{\"a\":2}");
+        assert_eq!(out[2], "{\"a\":3}");
+    }
+
+    #[test]
+    fn broken_pretty_printed_doc_avoids_line_repair() {
+        // Lines are fragments, so this must go through whole-input repair
+        // and come back as one document, not a pile of coerced strings.
+        let raw = "{\n  \"a\": 1,\n  \"b\": [1, 2\n";
+        let out = repair_source(raw, false, true).unwrap();
+        assert_eq!(out.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["a"], 1);
+        assert_eq!(v["b"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn deeply_nested_valid_json_does_not_overflow() {
+        let depth = 100_000;
+        let raw = format!("{}0{}", "[".repeat(depth), "]".repeat(depth));
+        let out = repair_source(&raw, false, true).unwrap();
+        assert_eq!(out, vec![raw]);
     }
 
     #[test]

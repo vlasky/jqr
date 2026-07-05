@@ -8,6 +8,7 @@ license = "MIT"
 [dependencies]
 serde_json = { version = "1", features = ["unbounded_depth"] }
 serde = "1"
+serde_stacker = "0.1"
 jsonrepair-rs = "0.2"
 
 [profile.release]
