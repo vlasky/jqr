@@ -1,0 +1,71 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml version
+        run: |
+          CARGO_VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$CARGO_VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $CARGO_VERSION" >&2
+            exit 1
+          fi
+      - name: Create draft release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release list --repo "$GITHUB_REPOSITORY" --json tagName \
+               --jq '.[].tagName' | grep -qx "$GITHUB_REF_NAME"; then
+            gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+              --draft --title "jqr ${GITHUB_REF_NAME#v}" --generate-notes
+          fi
+
+  build:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Package
+        run: |
+          NAME="jqr-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          mkdir "$NAME"
+          cp "target/${{ matrix.target }}/release/jqr" LICENSE README.md "$NAME"/
+          tar czf "$NAME.tar.gz" "$NAME"
+          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" \
+            jqr-*.tar.gz jqr-*.tar.gz.sha256 --clobber
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft=false

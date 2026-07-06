@@ -30,10 +30,15 @@ fn run() {
 
     // Extract jqr-specific flags, respecting argument positions.
     // Flags that are values to --arg/--argjson/etc must not be stripped.
-    let (no_jq, quiet, strict, show_help, argv) = extract_jqr_flags(&argv);
+    let (no_jq, quiet, strict, show_help, show_version, argv) = extract_jqr_flags(&argv);
 
     if show_help {
         print_help();
+        return;
+    }
+
+    if show_version {
+        print_version();
         return;
     }
 
@@ -136,28 +141,36 @@ fn run() {
 
 /// Extract jqr-specific flags from argv, skipping tokens that are consumed as
 /// values by preceding options (--arg, --argjson, etc).
-fn extract_jqr_flags(argv: &[String]) -> (bool, bool, bool, bool, Vec<String>) {
+fn extract_jqr_flags(argv: &[String]) -> (bool, bool, bool, bool, bool, Vec<String>) {
     let mut no_jq = false;
     let mut quiet = false;
     let mut strict = false;
     let mut show_help = false;
+    let mut show_version = false;
     let mut result: Vec<String> = Vec::new();
+
+    // jq keeps recognising options after --args/--jsonargs (only non-option
+    // tokens become positionals), so -V/--version/-h/--help stay intercepted
+    // there, but jqr-only flags are passed through so jq can reject them the
+    // same way it would reject them itself. Only -- ends option parsing.
+    let mut args_mode = false;
 
     let mut i = 0;
     while i < argv.len() {
         let tok = &argv[i];
-
-        // After --args/--jsonargs, everything is a positional value
-        if tok == "--args" || tok == "--jsonargs" {
-            result.extend(argv[i..].iter().cloned());
-            break;
-        }
 
         // After the option terminator, everything is filter/file arguments
         // for jq, never jqr flags
         if tok == "--" {
             result.extend(argv[i..].iter().cloned());
             break;
+        }
+
+        if tok == "--args" || tok == "--jsonargs" {
+            args_mode = true;
+            result.push(tok.clone());
+            i += 1;
+            continue;
         }
 
         // Check if this is a long option that consumes extra tokens
@@ -203,19 +216,48 @@ fn extract_jqr_flags(argv: &[String]) -> (bool, bool, bool, bool, Vec<String>) {
                 i += 1;
                 continue;
             }
+
+            // Simple bundle (no extra-consuming flags): intercept bundled
+            // V/h the way jq itself would, pass the rest through
+            if tok.len() > 2 && chars.iter().any(|c| *c == 'V' || *c == 'h') {
+                if chars.contains(&'V') {
+                    show_version = true;
+                }
+                if chars.contains(&'h') {
+                    show_help = true;
+                }
+                let rest: String = chars.iter().filter(|c| **c != 'V' && **c != 'h').collect();
+                if !rest.is_empty() {
+                    result.push(format!("-{rest}"));
+                }
+                i += 1;
+                continue;
+            }
         }
 
         match tok.as_str() {
-            "--no-jq" => no_jq = true,
-            "--quiet" => quiet = true,
-            "--strict" => strict = true,
+            "--no-jq" if !args_mode => no_jq = true,
+            "--quiet" if !args_mode => quiet = true,
+            "--strict" if !args_mode => strict = true,
             "-h" | "--help" => show_help = true,
+            "-V" | "--version" => show_version = true,
             _ => result.push(tok.clone()),
         }
         i += 1;
     }
 
-    (no_jq, quiet, strict, show_help, result)
+    (no_jq, quiet, strict, show_help, show_version, result)
+}
+
+fn print_version() {
+    let jqr_version = env!("CARGO_PKG_VERSION");
+    match Command::new("jq").arg("--version").output() {
+        Ok(o) if o.status.success() => {
+            let jq_version = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            println!("jqr {jqr_version} ({jq_version})");
+        }
+        _ => println!("jqr {jqr_version}"),
+    }
 }
 
 fn print_help() {
@@ -231,9 +273,11 @@ Usage:
   <stdin> | jqr [JQR-FLAGS] [JQ-OPTIONS] [FILTER]
 
 jqr-specific flags (not passed to jq):
-  --no-jq     Repair and pretty-print only, do not run jq
-  --quiet     Suppress repair warnings
-  --strict    Fail if input is not valid JSON (no repair)
+  --no-jq        Repair and pretty-print only, do not run jq
+  --quiet        Suppress repair warnings
+  --strict       Fail if input is not valid JSON (no repair)
+  -V, --version  Show jqr and jq versions
+  -h, --help     Show this help
 
 All other options and flags are passed to jq unchanged.
 See jq --help for the full list.
@@ -308,16 +352,58 @@ mod tests {
 
     #[test]
     fn dashdash_stops_jqr_flag_stripping() {
-        let (no_jq, quiet, strict, help, rest) =
-            extract_jqr_flags(&sv(&["-n", "--", "--quiet", "--no-jq", "--help"]));
-        assert!(!no_jq && !quiet && !strict && !help);
-        assert_eq!(rest, sv(&["-n", "--", "--quiet", "--no-jq", "--help"]));
+        let (no_jq, quiet, strict, help, version, rest) =
+            extract_jqr_flags(&sv(&["-n", "--", "--quiet", "--no-jq", "--help", "--version"]));
+        assert!(!no_jq && !quiet && !strict && !help && !version);
+        assert_eq!(rest, sv(&["-n", "--", "--quiet", "--no-jq", "--help", "--version"]));
     }
 
     #[test]
     fn jqr_flags_before_dashdash_still_stripped() {
-        let (_, quiet, _, _, rest) = extract_jqr_flags(&sv(&["--quiet", "--", "--no-jq"]));
+        let (_, quiet, _, _, _, rest) = extract_jqr_flags(&sv(&["--quiet", "--", "--no-jq"]));
         assert!(quiet);
         assert_eq!(rest, sv(&["--", "--no-jq"]));
+    }
+
+    #[test]
+    fn version_flag_is_intercepted() {
+        let (_, _, _, _, version, rest) = extract_jqr_flags(&sv(&["--version"]));
+        assert!(version);
+        assert!(rest.is_empty());
+        let (_, _, _, _, version, _) = extract_jqr_flags(&sv(&["-V"]));
+        assert!(version);
+    }
+
+    #[test]
+    fn bundled_version_flag_is_intercepted() {
+        let (_, _, _, _, version, rest) = extract_jqr_flags(&sv(&["-nV"]));
+        assert!(version);
+        assert_eq!(rest, sv(&["-n"]));
+        let (_, _, _, help, version, rest) = extract_jqr_flags(&sv(&["-Vh"]));
+        assert!(version && help);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn version_after_args_mode_is_still_intercepted() {
+        let (_, _, _, _, version, rest) =
+            extract_jqr_flags(&sv(&["--args", "$ARGS.positional", "--version"]));
+        assert!(version);
+        assert_eq!(rest, sv(&["--args", "$ARGS.positional"]));
+    }
+
+    #[test]
+    fn jqr_flags_after_args_mode_pass_through_to_jq() {
+        let (_, quiet, _, _, _, rest) = extract_jqr_flags(&sv(&["--args", ".", "--quiet"]));
+        assert!(!quiet);
+        assert_eq!(rest, sv(&["--args", ".", "--quiet"]));
+    }
+
+    #[test]
+    fn version_as_arg_value_is_not_intercepted() {
+        let (_, _, _, _, version, rest) =
+            extract_jqr_flags(&sv(&["--arg", "x", "--version", "."]));
+        assert!(!version);
+        assert_eq!(rest, sv(&["--arg", "x", "--version", "."]));
     }
 }

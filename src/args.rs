@@ -12,7 +12,7 @@ const LONG_EXTRA: &[(&str, usize)] = &[
     ("--rawfile", 2),
 ];
 
-const META_FLAGS: &[&str] = &["-V", "--version", "--build-configuration"];
+const META_FLAGS: &[&str] = &["--build-configuration"];
 
 pub fn is_meta_flag(s: &str) -> bool {
     META_FLAGS.contains(&s)
