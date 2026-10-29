@@ -73,15 +73,16 @@ fn run() {
         Err(e) => { eprintln!("jqr: {e}"); exit(1); }
     };
 
-    if sources.iter().all(|(_, raw)| raw.trim().is_empty()) {
-        eprintln!("jqr: empty input");
-        exit(1);
-    }
+    // Wholly empty input still goes to jq, which decides the output and exit
+    // code (nothing and 0 by default, `[]` with -s, 4 with -e).
+    let all_empty = sources.iter().all(|(_, raw)| raw.trim().is_empty());
 
     let mut objects: Vec<String> = Vec::new();
     for (label, raw) in &sources {
         if raw.trim().is_empty() {
-            eprintln!("jqr: skipping empty input: {label}");
+            if !all_empty {
+                eprintln!("jqr: skipping empty input: {label}");
+            }
             continue;
         }
         match repair::repair_source(raw, strict, quiet) {

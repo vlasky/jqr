@@ -1,6 +1,6 @@
 [package]
 name = "jqr"
-version = "1.1.0"
+version = "1.1.1"
 edition = "2024"
 description = "jq for broken JSON - repairs truncated/mangled JSON before querying"
 license = "MIT"
